@@ -81,6 +81,7 @@ static void close_and_free_server(EV_P_ server_t *server);
 
 int verbose    = 0;
 int reuse_port = 0;
+int forward_tcp = 0;
 
 static crypto_t *crypto;
 
@@ -238,8 +239,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         return;
     }
 
-    int err = crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
-
+    int err = 0;
+    if (!forward_tcp) {
+        crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
+    }
     if (err) {
         LOGE("invalid password or cipher");
         close_and_free_remote(EV_A_ remote);
@@ -379,7 +382,10 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     server->buf->len = r;
 
-    int err = crypto->decrypt(server->buf, server->d_ctx, SOCKET_BUF_SIZE);
+    int err = 0;
+    if (!forward_tcp) {
+        crypto->decrypt(server->buf, server->d_ctx, SOCKET_BUF_SIZE);
+    }
     if (err == CRYPTO_ERROR) {
         LOGE("invalid password or cipher");
         close_and_free_remote(EV_A_ remote);
@@ -425,6 +431,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
     remote_ctx_t *remote_send_ctx = (remote_ctx_t *)w;
     remote_t *remote              = remote_send_ctx->remote;
     server_t *server              = remote->server;
+    int allow_empty_data = 0;
 
     ev_timer_stop(EV_A_ & remote_send_ctx->watcher);
 
@@ -438,11 +445,15 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
         }
         if (r == 0) {
             remote_send_ctx->connected = 1;
-
+            
             ev_io_stop(EV_A_ & remote_send_ctx->io);
             ev_io_stop(EV_A_ & server->recv_ctx->io);
             ev_io_start(EV_A_ & remote->recv_ctx->io);
 
+            if (forward_tcp) {
+                allow_empty_data = 1;
+                goto send_data;
+            }
             // send destaddr
             buffer_t ss_addr_to_send;
             buffer_t *abuf = &ss_addr_to_send;
@@ -453,26 +464,29 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
 
                 size_t in6_addr_len = sizeof(struct in6_addr);
                 memcpy(abuf->data + abuf->len,
-                       &(((struct sockaddr_in6 *)&(server->destaddr))->sin6_addr),
-                       in6_addr_len);
+                    &(((struct sockaddr_in6 *)&(server->destaddr))->sin6_addr),
+                    in6_addr_len);
                 abuf->len += in6_addr_len;
                 memcpy(abuf->data + abuf->len,
-                       &(((struct sockaddr_in6 *)&(server->destaddr))->sin6_port),
-                       2);
+                    &(((struct sockaddr_in6 *)&(server->destaddr))->sin6_port),
+                    2);
             } else {                             // IPv4
                 abuf->data[abuf->len++] = 1; // Type 1 is IPv4 address
 
                 size_t in_addr_len = sizeof(struct in_addr);
                 memcpy(abuf->data + abuf->len,
-                       &((struct sockaddr_in *)&(server->destaddr))->sin_addr, in_addr_len);
+                    &((struct sockaddr_in *)&(server->destaddr))->sin_addr, in_addr_len);
                 abuf->len += in_addr_len;
                 memcpy(abuf->data + abuf->len,
-                       &((struct sockaddr_in *)&(server->destaddr))->sin_port, 2);
+                    &((struct sockaddr_in *)&(server->destaddr))->sin_port, 2);
             }
 
             abuf->len += 2;
 
-            int err = crypto->encrypt(abuf, server->e_ctx, SOCKET_BUF_SIZE);
+            int err = 0;
+            if (!forward_tcp) {
+                err = crypto->encrypt(abuf, server->e_ctx, SOCKET_BUF_SIZE);
+            }
             if (err) {
                 LOGE("invalid password or cipher");
                 bfree(abuf);
@@ -480,8 +494,9 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 close_and_free_server(EV_A_ server);
                 return;
             }
-
-            err = crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
+            if (!forward_tcp) {
+                err = crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
+            }
             if (err) {
                 LOGE("invalid password or cipher");
                 bfree(abuf);
@@ -500,8 +515,13 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             return;
         }
     }
+send_data:
 
     if (remote->buf->len == 0) {
+        if (allow_empty_data) {
+            ev_io_start(EV_A_ & server->recv_ctx->io);
+            return;
+        }
         // close and free
         close_and_free_remote(EV_A_ remote);
         close_and_free_server(EV_A_ server);
@@ -509,7 +529,6 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
     } else {
         // has data to send
         int s = -1;
-
         if (remote->addr != NULL) {
 #if defined(TCP_FASTOPEN_CONNECT)
             int optval = 1;
@@ -646,10 +665,12 @@ new_server(int fd)
     server->send_ctx->server    = server;
     server->send_ctx->connected = 0;
 
-    server->e_ctx = ss_malloc(sizeof(cipher_ctx_t));
-    server->d_ctx = ss_malloc(sizeof(cipher_ctx_t));
-    crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
-    crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    if (!forward_tcp) {
+        server->e_ctx = ss_malloc(sizeof(cipher_ctx_t));
+        server->d_ctx = ss_malloc(sizeof(cipher_ctx_t));
+        crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
+        crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
+    }
 
     ev_io_init(&server->recv_ctx->io, server_recv_cb, fd, EV_READ);
     ev_io_init(&server->send_ctx->io, server_send_cb, fd, EV_WRITE);
@@ -724,7 +745,8 @@ accept_cb(EV_P_ ev_io *w, int revents)
 #endif
 
     int index                    = rand() % listener->remote_num;
-    struct sockaddr *remote_addr = listener->remote_addr[index];
+    struct sockaddr *remote_addr = forward_tcp ? \
+        (struct sockaddr*)&destaddr : listener->remote_addr[index];
 
     int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
     if (remotefd == -1) {
@@ -870,6 +892,7 @@ main(int argc, char **argv)
         { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
         { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
         { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
+        { "forward-tcp", no_argument,       NULL, GETOPT_VAL_FORWARD_TCP },
         { NULL,                          0, NULL,                      0 }
     };
 
@@ -906,6 +929,9 @@ main(int argc, char **argv)
             break;
         case GETOPT_VAL_REUSE_PORT:
             reuse_port = 1;
+            break;
+        case GETOPT_VAL_FORWARD_TCP:
+            forward_tcp = 1;
             break;
         case 's':
             if (remote_num < MAX_REMOTE_NUM) {
