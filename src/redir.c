@@ -1077,8 +1077,8 @@ main(int argc, char **argv)
         dscp     = conf->dscp;
     }
 
-    if (remote_num == 0 || remote_port == NULL || local_port == NULL
-        || (password == NULL && key == NULL)) {
+    int ss_mode_bad_args = (remote_num == 0 || remote_port == NULL || (password == NULL && key == NULL));
+    if ((!forward_tcp && ss_mode_bad_args) || local_port == NULL) {
         usage();
         exit(EXIT_FAILURE);
     }
@@ -1178,12 +1178,15 @@ main(int argc, char **argv)
     ev_signal_start(EV_DEFAULT, &sigterm_watcher);
     ev_signal_start(EV_DEFAULT, &sigchld_watcher);
 
-    // Setup keys
-    LOGI("initializing ciphers... %s", method);
-    crypto = crypto_init(password, key, method);
-    if (crypto == NULL)
-        FATAL("failed to initialize ciphers");
-
+    if (!forward_tcp) {
+        // Setup keys
+        LOGI("initializing ciphers... %s", method);
+        crypto = crypto_init(password, key, method);
+        if (crypto == NULL)
+            FATAL("failed to initialize ciphers");
+    } else {
+        crypto = NULL;
+    }
     // Setup proxy context
     struct listen_ctx listen_ctx;
     memset(&listen_ctx, 0, sizeof(struct listen_ctx));
